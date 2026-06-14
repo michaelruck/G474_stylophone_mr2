@@ -1,0 +1,213 @@
+// ============================================================================
+// DWT Profiling für ProcessAudioData()
+// STM32G474, Cortex-M4 @ 170MHz
+// ============================================================================
+//
+// SCHRITT 1: DWT einmalig beim Boot aktivieren
+// In main() VOR dem Audio-Start einfügen:
+//
+//   CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+//   DWT->CYCCNT = 0;
+//   DWT->CTRL   |= DWT_CTRL_CYCCNTENA_Msk;
+//
+// ============================================================================
+//
+// SCHRITT 2: Profiling-Variablen (global oder static in app.cpp)
+
+struct AudioProfile {
+    uint32_t total;         // Gesamter Loop
+    uint32_t envelope;      // env.getEnvelope() + getCurrentLevel()
+    uint32_t lfo;           // lfo.getNextSample()
+    uint32_t oscillators;   // osc[].getNextSample()
+    uint32_t wavefolder;    // mr_wavefolder_process()
+    uint32_t filter;        // moog_ladder_c()
+    uint32_t echo;          // Echo_ProcessSample()
+    uint32_t samples;       // Anzahl gemessener Loops (für Mittelwert)
+};
+
+// Im CCM für schnellen Zugriff
+__attribute__((section(".ccmram"))) volatile AudioProfile prof = {0};
+
+// ============================================================================
+// SCHRITT 3: ProcessAudioData() mit Messpunkten
+// Ersetze deine bestehende Funktion:
+
+void ProcessAudioData(void) {
+    int32_t out;
+    float outf = 0, lfoSample, cutoff_hz_temp, volume_temp,
+          pulsewidth_temp, resonance_temp, envelope;
+
+    uint32_t t0, t1, t2, t3, t4, t5, t6, t7;
+    uint32_t acc_env=0, acc_lfo=0, acc_osc=0, acc_wf=0,
+             acc_flt=0, acc_echo=0;
+
+    t0 = DWT->CYCCNT;  // Loop-Start
+
+    for (int n = 0; n < (AUDIO_OUT_BUFFER_SIZE / AUDIO_OUT_CHANNELS) - 1;
+         n += AUDIO_OUT_CHANNELS) {
+
+        // --- Envelope ---
+        t1 = DWT->CYCCNT;
+        env.getEnvelope();
+        envelope = env.getCurrentLevel();
+        t2 = DWT->CYCCNT;
+        acc_env += t2 - t1;
+
+        // --- LFO ---
+        t1 = DWT->CYCCNT;
+        lfoSample = (lfo.getNextSample() / 2 + 0.5);
+        t2 = DWT->CYCCNT;
+        acc_lfo += t2 - t1;
+
+        resonance_temp = resonance;
+
+        if (lfo_target & (1 << 0))
+            cutoff_hz_temp = cutoff_hz * (lfoSample * lfo_depth + 1 - lfo_depth);
+        else
+            cutoff_hz_temp = cutoff_hz;
+        if (lfo_target & (1 << 1))
+            pulsewidth_temp = pulsewidth * (lfoSample * lfo_depth + 1 - lfo_depth);
+        else
+            pulsewidth_temp = pulsewidth;
+        if (lfo_target & (1 << 2))
+            volume_temp = volume * (lfoSample * lfo_depth + 1 - lfo_depth);
+        else
+            volume_temp = volume;
+
+        // --- Oszillatoren ---
+        t1 = DWT->CYCCNT;
+        if (suboctave == 0)
+            outf = osc[0].getNextSample();
+        else
+            outf = (osc[0].getNextSample() + osc[1].getNextSample()
+                    + osc[2].getNextSample()) / 3;
+        t2 = DWT->CYCCNT;
+        acc_osc += t2 - t1;
+
+        // --- Wavefolder ---
+        t1 = DWT->CYCCNT;
+        outf = mr_wavefolder_process(&wavefolder, outf);
+        t2 = DWT->CYCCNT;
+        acc_wf += t2 - t1;
+
+        if (envelope_target & (1 << 0)) {
+            outf = outf * envelope;
+        } else {
+            if (env.getState() == 0 || env.getState() == 4)
+                outf = 0;
+        }
+        if (envelope_target & (1 << 1)) {
+            cutoff_hz_temp = (cutoff_hz_temp - 200) * envelope * envelope * envelope + 200;
+            resonance_temp = resonance * (1 - envelope);
+        }
+        if (envelope_target & (1 << 2))
+            pulsewidth_temp = pulsewidth_temp * envelope;
+
+        switch (suboctave) {
+        case 0:
+            for (int i = 0; i < 3; i++) osc[i].setPulseWidth(pulsewidth_temp);
+            break;
+        case 1:
+            osc[0].setPulseWidth(pulsewidth_temp);
+            osc[1].setPulseWidth(pulsewidth_temp);
+            osc[2].setPulseWidth(pulsewidth_temp);
+            break;
+        case 2:
+            osc[0].setPulseWidth(pulsewidth_temp - 0.1f);
+            osc[1].setPulseWidth(pulsewidth_temp);
+            osc[2].setPulseWidth(pulsewidth_temp + 0.1f);
+            break;
+        case 3:
+            osc[0].setPulseWidth(0.0);
+            osc[1].setPulseWidth(pulsewidth_temp);
+            osc[2].setPulseWidth(0.0);
+            break;
+        case 4:
+            osc[0].setPulseWidth(pulsewidth_temp - 0.1f);
+            osc[1].setPulseWidth(pulsewidth_temp);
+            osc[2].setPulseWidth(pulsewidth_temp + 0.1f);
+            break;
+        case 5:
+            osc[0].setPulseWidth(pulsewidth_temp / 2);
+            osc[1].setPulseWidth(0.0);
+            osc[2].setPulseWidth(1.0f - pulsewidth_temp / 2);
+            break;
+        default:
+            for (int i = 0; i < 3; i++) osc[i].setPulseWidth(pulsewidth_temp);
+            break;
+        }
+
+        // --- Filter ---
+        t1 = DWT->CYCCNT;
+        outf = moog_ladder_c(outf, cutoff_hz_temp, resonance_temp, 1.0);
+        t2 = DWT->CYCCNT;
+        acc_flt += t2 - t1;
+
+        // --- Echo ---
+        t1 = DWT->CYCCNT;
+        out = (int32_t)(outf * fToInt32 * volume_temp);
+        out = Echo_ProcessSample(out);
+        t2 = DWT->CYCCNT;
+        acc_echo += t2 - t1;
+
+        audioOutBufPtr[n]     = out;
+        audioOutBufPtr[n + 1] = out;
+    }
+
+    t7 = DWT->CYCCNT;
+
+    // Ergebnisse akkumulieren (gleitender Mittelwert über 256 Aufrufe)
+    prof.envelope    = (prof.envelope    * 255 + acc_env)  / 256;
+    prof.lfo         = (prof.lfo         * 255 + acc_lfo)  / 256;
+    prof.oscillators = (prof.oscillators * 255 + acc_osc)  / 256;
+    prof.wavefolder  = (prof.wavefolder  * 255 + acc_wf)   / 256;
+    prof.filter      = (prof.filter      * 255 + acc_flt)  / 256;
+    prof.echo        = (prof.echo        * 255 + acc_echo) / 256;
+    prof.total       = (prof.total       * 255 + (t7 - t0)) / 256;
+    prof.samples++;
+
+    dataReadyFlag = 0;
+}
+
+// ============================================================================
+// SCHRITT 4: Ergebnisse lesen
+//
+// In STM32CubeIDE: Debugger starten, dann Live Expressions oder
+// Memory Browser auf &prof setzen.
+//
+// ODER: Werte per UART ausgeben (einmalig, z.B. auf Tastendruck):
+//
+//   uint32_t budget = 170000000 / 44271;  // Zyklen pro Sample = 3840
+//   uint32_t samples_per_loop = AUDIO_OUT_BUFFER_SIZE / AUDIO_OUT_CHANNELS / 2;
+//   // (je nach deiner Buffer-Konfiguration)
+//
+//   printf("=== Audio Profiling (Zyklen pro Loop) ===\r\n");
+//   printf("Total:       %6lu  (%lu%% CPU)\r\n",
+//       prof.total, prof.total * 100 / (budget * samples_per_loop));
+//   printf("Envelope:    %6lu  (%lu%%)\r\n",
+//       prof.envelope, prof.envelope * 100 / prof.total);
+//   printf("LFO:         %6lu  (%lu%%)\r\n",
+//       prof.lfo, prof.lfo * 100 / prof.total);
+//   printf("Oscillators: %6lu  (%lu%%)\r\n",
+//       prof.oscillators, prof.oscillators * 100 / prof.total);
+//   printf("Wavefolder:  %6lu  (%lu%%)\r\n",
+//       prof.wavefolder, prof.wavefolder * 100 / prof.total);
+//   printf("Filter:      %6lu  (%lu%%)\r\n",
+//       prof.filter, prof.filter * 100 / prof.total);
+//   printf("Echo:        %6lu  (%lu%%)\r\n",
+//       prof.echo, prof.echo * 100 / prof.total);
+//
+// ============================================================================
+// INTERPRETATION:
+//
+// Budget pro Sample: 170MHz / 44271Hz = ~3840 Zyklen
+// Bei AUDIO_OUT_BUFFER_SIZE Samples pro Loop entsprechend multiplizieren.
+//
+// Faustregel:
+//   prof.total < 70% des Budgets  → G474 reicht, kein Chip-Wechsel nötig
+//   prof.total > 85% des Budgets  → knapp, Polyphonie schwierig
+//   prof.total > 95% des Budgets  → Chip-Wechsel sinnvoll
+//
+// Der größte Einzelwert zeigt wo zu optimieren ist.
+// Erfahrungsgemäß: Filter und Wavefolder sind die Hauptkandidaten.
+// ============================================================================

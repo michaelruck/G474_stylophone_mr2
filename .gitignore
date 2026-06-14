@@ -1,0 +1,16 @@
+# Build output
+Debug/
+Release/
+
+# Backup files
+*.bak
+*_bak
+*_bak.zip
+*.bak.zip
+*.bak.*
+
+# IDE / Eclipse
+.settings/
+
+# Launch configurations (optional – uncomment to exclude)
+# *.launch
