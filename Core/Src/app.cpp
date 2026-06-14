@@ -188,8 +188,6 @@ mrDDS_Voice voice[3];
 
 MrMoogLadder filterL, filterR;
 
-moog_ladder_state_t moog_L = { 0 };
-moog_ladder_state_t moog_R = { 0 };
 
 /* Functions */
 void shutdown() {
