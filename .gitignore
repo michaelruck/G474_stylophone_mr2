@@ -9,6 +9,10 @@ Release/
 *.bak.zip
 *.bak.*
 
+# Private documents
+*.ods
+*.odt
+
 # IDE / Eclipse
 .settings/
 
